@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
+
 from math import ceil, floor
 import copy
 import time
+
+from collections import OrderedDict
 
 import torch
 from torch.utils.data import DataLoader, Sampler
@@ -15,7 +19,8 @@ from typing import Optional, Union, Callable, Tuple, Sequence
 class AdvanceImageFolder(ImageFolder):
 
     def __init__(self, 
-                 root: Optional[str],
+                 root: str,
+                 name: Optional[str] = None,
                  transform: Optional[Callable] = None,
                  target_transform: Optional[Callable] = None,
                  load_percentage: Optional[float] = None,
@@ -32,10 +37,12 @@ class AdvanceImageFolder(ImageFolder):
 
             Args:
                 root (str): the path to root directory (as ImageFolder).
+                name (str): the name of the dataset. If None, the name of the root will
+                be used.
                 transform (Callable): a function to transform the PIL images 
                 (once loaded from memory).
                 target_transform (Callable): a function to transform labels.
-                load_percentage (float): the percentage of the dataset to consider. 
+                load_percentage (float): the percentage of the dataset to consider.  
                 Random samples will be taken without repetitions.
                 indices (list of int): a list of indices to directly specify a subset of
                 the dataset.
@@ -48,7 +55,7 @@ class AdvanceImageFolder(ImageFolder):
         """
 
         # check load_percentage 
-        if load_percentage and (load_percentage < 0 or load_percentage > 1):
+        if load_percentage and not (0 <= load_percentage <= 1):
             raise ValueError(f"load_percentage = {load_percentage} not in interval \
                                [0, 1]")
 
@@ -60,6 +67,12 @@ class AdvanceImageFolder(ImageFolder):
         self.load_percentage = load_percentage
         self.seed = seed
 
+        # if name is None, use the root directory name as dataset name
+        
+        if not name:
+            name = os.path.basename(os.path.dirname(os.path.join(root, "")))
+
+        self.name = name
 
         # initialize from root
         super().__init__(root=root, 
@@ -81,34 +94,46 @@ class AdvanceImageFolder(ImageFolder):
         
         if indices is not None:
             self.samples = [self.samples[i] for i in indices]
-        else:
-            self.samples = [self.samples[i] for i in range(len(self.samples))]
+        
+        # ids lookup table: (id: index). Useful when subsetting and/or splitting. Indices
+        # are always kept between 0 to len-1, while ids reference to original index.
+        # Initialized with ids=indices.
+        self.ids2indices = OrderedDict([(i, i) for i in range(len(self.samples))])
+        self.ids = list(self.ids2indices.keys())
 
-        self.ids = [i for i in range(len(self.samples))]
         self.pseudolabels = -torch.ones(len(self.samples)).long()
 
         # variables for dataset loaded into RAM.
         self.ram_samples = None
 
 
+    def __repr__(self) -> str:
+        
+        return f"AdvanceImageFolder: [Name='{self.name}', Length={len(self)}, " + \
+               f"Classes={len(self.classes)}, Root='{self.root}']"
+
+
     def subset(self, 
                indices: Optional[list[int]] = None,
+               subset_name: Optional[str] = None,
                ids: Optional[list[int]] = None) -> AdvanceImageFolder:
         """
             Get a subset of current dataset. Use a list of integer indices to select 
             the samples of the subset or a list of interged images ids. 
            
-            NOTE:
+            Note:
                 every image has a unique index that specify its position in the sequence.
                 every image has also a unique id number (may be equal to the index or 
                 not).
 
             Args:
                 indices (list of int): the indices to select.
+                subset_name (str): the name of the split.
                 ids (list of int): the ids to select.
 
             Raises:
                 ValueError if zero or two of [indices, ids] are set.
+
             Returns:
                 a subset of current dataset.
         """
@@ -119,11 +144,8 @@ class AdvanceImageFolder(ImageFolder):
         subset_dataset = copy.copy(self)
 
         # if ids are specified -> select indices of given ids.
-        if ids:
-            ids = set(ids)
-            indices = [i for i in range(len(subset_dataset)) 
-                       if subset_dataset.ids[i] in ids]
-
+        if ids is not None:
+            indices = [self.ids2indices[i] for i in ids]
 
         # select samples
         subset_dataset.samples = [subset_dataset.samples[i] for i in indices]
@@ -132,13 +154,17 @@ class AdvanceImageFolder(ImageFolder):
         subset_dataset.pseudolabels = torch.LongTensor([subset_dataset.pseudolabels[i] 
                                                        for i in indices])
 
-        # select ids                                        
+        # update ids and ids2indices (id:index) lookup table                                    
         subset_dataset.ids = [subset_dataset.ids[i] for i in indices]
+        subset_dataset.ids2indices = \
+        OrderedDict([(subset_dataset.ids[i], i) for i in range(len(indices))])
         
         # select ram samples
         if subset_dataset.ram_samples is not None:
             subset_dataset.ram_samples = [subset_dataset.ram_samples[i] for i in indices]
 
+        subset_name = f"({subset_name})" if subset_name is not None else '(subset)'
+        subset_dataset.name = self.name + subset_name
         return subset_dataset
 
 
@@ -222,15 +248,17 @@ class AdvanceImageFolder(ImageFolder):
                           drop_last=drop_last,
                           collate_fn=AdvanceImageFolder._collate_fn)
 
-    def split(self, 
-              percentages: list[float],
-              seed: Optional[int] = 1234) \
-              -> Union[Tuple[AdvanceImageFolder], AdvanceImageFolder]:
+    def random_split(self, 
+                     percentages: list[float],
+                     split_names: Optional[list[str]] = None,
+                     seed: Optional[int] = 1234) \
+                     -> Union[Tuple[AdvanceImageFolder], AdvanceImageFolder]:
         """
             Split the dataset in subdatasets and return them as a tuple.
 
             Args:
                 percentages (list of floats): a percentage for each partition.
+                split_names (list of str): the names of splits.
                 seed (int): seed for RNG.
 
             Raises:
@@ -244,11 +272,14 @@ class AdvanceImageFolder(ImageFolder):
 
         # check percentages
         for p in percentages:
-            if p < 0 or p > 1:
+            if not 0 <= p <= 1:
                 raise ValueError("Percentages should be in interval [0, 1].")
 
         if sum(percentages) > 1:
             raise ValueError("Percentages sum should be less or equal to one.")
+
+        if split_names is None or not isinstance(split_names, list):
+            split_names = [None for _ in percentages]
 
         # convert percentages to lengths
         lengths = [floor(self.__len__() * p) for p in percentages]
@@ -269,21 +300,22 @@ class AdvanceImageFolder(ImageFolder):
         
         # just one split
         if len(subsets_indices) == 1:
-            return self.subset(subsets_indices[0])
+            return self.subset(subsets_indices[0], split_names[0])
 
         # more splits
-        return tuple(self.subset(indices) for indices in subsets_indices)
+        return tuple(self.subset(indices, split_names[i]) 
+                     for i, indices in enumerate(subsets_indices))
 
 
     def update_pseudolabels(self,
-                            values: torch.LongTensor,
+                            values: Union[torch.LongTensor, list[int]],
                             indices: Optional[Union[torch.LongTensor, list[int]]] = None,
                             ids: Optional[Union[torch.LongTensor, list[int]]] = None):
         """
             Updates the pseudolabels with values at given indices or ids.
 
             Args:
-                values (torch.LongTensor): the values of new pseudolabels.
+                values (torch.LongTensor | list of int): the values of new pseudolabels.
                 indices (torch.LongTensor | list of int): the indices of new 
                 pseudolabels.
                 indices (torch.LongTensor | list of int): the ids of new pseudolabels.
@@ -292,33 +324,16 @@ class AdvanceImageFolder(ImageFolder):
                 ValueError if zero or both [indices, ids] are set.
         """ 
 
-        if not (indices is None ^ ids is None):
+        if not (indices is None) ^ (ids is None):
             raise ValueError("One and just one of [indices, ids] should be set.")
 
-        #  get indices from ids
-        if ids:
-            if isinstance(ids, torch.LongTensor):
-                ids = ids.tolist()
+        if ids is not None:
+            indices = [self.ids2indices[i] for i in ids]
 
-            indices = []
-            for id in ids:
-                for i in range(len(self)):
-                    if self.ids[i] == id:
-                        indices.append(i)
-                        break
-
-            if len(indices) != len(ids):
-                raise ValueError("Some ids not found!")
+        if isinstance(values, list):
+            values = torch.LongTensor(values)
 
         self.pseudolabels[indices] = values
-
-
-    @staticmethod
-    def collate_fn(batch):
-        """
-            Custom collate_fn to load PIL images.
-        """
-        return batch
 
 
     def loaded(self) -> bool:
@@ -371,12 +386,12 @@ class AdvanceImageFolder(ImageFolder):
         # take a dataloder for multi worker processing
         loader = DataLoader(self, batch_size=batch_size, shuffle=False, 
                             num_workers=num_workers, drop_last=False, 
-                            collate_fn=AdvanceImageFolder.collate_fn)
+                            collate_fn=AdvanceImageFolder._collate_fn)
 
         ram_samples = []
 
         for batch in loader:
-            ram_samples = ram_samples + batch
+            ram_samples = ram_samples + list(zip(batch.image, batch.label))
 
         # set the getitem function to read images from ram.
         self.ram_samples = ram_samples
@@ -401,19 +416,19 @@ class AdvanceImageFolder(ImageFolder):
         """
 
         if not self.loaded():
-            path, target = self.samples[index]
-            sample = self.loader(path)
+            path, label = self.samples[index]
+            image = self.loader(path)
         else:
-            sample, target = self.ram_samples[index]
+            image, label = self.ram_samples[index]
 
         if self.transform is not None:
-            sample = self.transform(sample)
+            image = self.transform(image)
 
         if self.target_transform is not None:
-            target = self.target_transform(target)
+            label = self.target_transform(label)
 
-        return SimpleNamespace(image=sample, 
-                               label=target,
+        return SimpleNamespace(image=image, 
+                               label=label,
                                pseudolabel=self.pseudolabels[index],
                                id=self.ids[index],
                                index=index)
@@ -424,7 +439,7 @@ class AdvanceImageFolder(ImageFolder):
             Change the transform to apply to inputs.
 
             Args:
-                transform (torch.transform): the transform to apply to inputs.
+                transform (torchvision.transform): the transform to apply to inputs.
         """
         self.transform = transform
 
@@ -434,7 +449,7 @@ class AdvanceImageFolder(ImageFolder):
             Change the transform to apply to labels.
 
             Args:
-                transform (torch.transform): the transform to apply to labels.
+                transform (torchvision.transform): the transform to apply to labels.
             
         """
         self.target_transform = target_transform
