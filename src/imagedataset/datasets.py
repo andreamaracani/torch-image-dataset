@@ -197,7 +197,7 @@ class AdvanceImageFolder(ImageFolder):
                 # shared memory tensor to avoid an extra copy
                 numel = sum(x.numel() for x in image)
                 storage = image[0].storage()._new_shared(numel)
-                out = image[0].image.new(storage)
+                out = image[0].new(storage)
 
             image = torch.stack(image, 0, out=out)
     
