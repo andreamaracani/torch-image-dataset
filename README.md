@@ -1,4 +1,8 @@
 # torch image dataset
+Install:
+```
+  pip install torch-image-dataset
+```
 
 ## Datasets for image classification
 
@@ -7,6 +11,11 @@
 - keep track of pseudolabels (read/update).
 - load full dataset into RAM to speed up training when disk memory access is slow.
 - easy subsetting/splitting keeping the possibility to update and read pseudolabels.
+
+Import:
+```
+  from imagedataset import AdvanceImageFolder
+```
 
 It is a subclass of ``` torchvision.datasets.ImageFolder``` so it asks for a dataset structure in the form:
 ```
