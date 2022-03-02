@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 VERSION = '0.0.1' 
 DESCRIPTION = 'Image datasets for Pytorch.'
-LONG_DESCRIPTION = 'Some classes that help to load images, as dataset, for Pytorch project.'
+LONG_DESCRIPTION = 'Some classes that help to load images, as dataset, for Pytorch projects.'
 
 # Setting up
 setup(
