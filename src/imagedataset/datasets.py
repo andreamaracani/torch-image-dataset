@@ -5,15 +5,388 @@ import os
 from math import ceil, floor
 import copy
 import time
-
 from collections import OrderedDict
 
-import torch
-from torch.utils.data import DataLoader, Sampler
-from torchvision.datasets import ImageFolder
 
+import torch
+
+from torch.utils.data import DataLoader, Sampler, Dataset
+from torchvision.datasets import ImageFolder
+import torch.nn as nn
+import lmdb
+import torch.nn as nn
+import cv2
 from types import SimpleNamespace
-from typing import Optional, Union, Callable, Tuple, Sequence
+from typing import Optional, Union, Callable, Tuple, Sequence, TypeVar, Any
+from .utils import get_dir_names, get_file_names, match_file_names
+from .write_database import *
+from .loaders import *
+
+X, Y = TypeVar('X'), TypeVar('Y')
+
+
+class BasicImageFolder(Dataset):
+
+    """
+        A simple dataset of images. It should be structured as (names are arbitrary):
+    
+          root/
+            ├── class 1 
+            │     ├── image_1.ext
+            │     ├── image_2.ext
+            │     ├── image_3.ext
+            │     ├── ...
+            │     └── image_i.ext
+            │
+            ├── ...
+            │
+            └── class_k
+                  ├── image_1.ext
+                  ├── image_2.ext
+                  ├── image_3.ext
+                  ├── ...
+                  └── image_j.ext
+
+        For classification, the labels should be the names of the folders inside 'root',
+        but, for other tasks, it is possible to specify another root directory for
+        labels. In this case the folder structure should be the same and the name of 
+        labels should be the same as the corresponding images (without considering the 
+        format).
+
+        For example:
+            root_img/dog/dog1.jpg <=> root_lab/dog/dog1.xml is a correct pair.
+
+
+        Note on image loader:
+
+            - if `image_loader` is specified it will be used.
+
+            - if `image_loader` is None there are two possibilities:
+
+                1) if `force_pil_loader` is False and the image formats are PNG, JPG or 
+                   JPEG, than the DEFAULT LOADER is used: it reads images from disk and 
+                   returns torch.Tensors of torch.float32 in the range [0, 1].
+
+                2) if force_pil_loader is True or if there are formats not compatible 
+                   with the default loader, than PIL LOADER is used and it returns PIL 
+                   images.
+
+
+        Args:
+            root (string): the path to the root directory of images.
+            target_root (string, optional): the path to the root of directory of labels.
+            transform (callable, optional): A function/transform to be used on images.
+            target_transform (callable, optional): A function/transform to be used on 
+            labels.
+            image_loader (callable, optional): A function that loads an image from a 
+            path.
+            target_loader (callable, optional): A function that loads a label form a 
+            path.
+            force_pil_loader (bool, optional): True to force the use of PIL loader.
+            image_formats (list[str], optional): A list of allowed image formats, other
+            formats will be ignored. If None all formats are considered.
+            target_formats (list[str], optional): A list of allowed formats for targets,
+            other formats will be ignored. If None all formats are considered.
+
+        Note:
+            The default loaders return already torch.Tensor of floats in range [0, 1].
+    
+        Note: 
+            The default image_loader support just PNG, JPG and JPEG images, just use
+            a custom loader for other formats.
+            To load labels a label_loader is mandatory, since is None by default.
+    """
+
+    DEFAULT_LOADER_FORMATS = ["png", "jpg", "jpeg"]
+    PIL_LOADER_FORMATS = ["png", "jpg", "jpeg", "ppm", "bmp", "pgm", "tif", "tiff", 
+                          "webp"]
+
+
+    def __init__(self, 
+                 root: str,
+                 target_root: Optional[str] = None,
+                 transform: Optional[Callable[[X], torch.Tensor]] = None,
+                 target_transform: Optional[Callable[[Y], Any]] = None,
+                 image_loader: Optional[Callable[[str], X]] = None,
+                 target_loader: Optional[Callable[[str], Y]] = None,
+                 force_pil_loader: Optional[bool] = False,
+                 image_formats: Optional[list[str]] = ["png", "jpg", "jpeg"],
+                 target_formats: Optional[list[str]] = None):
+
+        if target_loader is None and target_root is not None:
+            raise ValueError("Target root selected but target loader is None.")
+
+
+        # do we need to use pil loader?
+        use_pil_loader = False
+
+        # check formats for default loaders and select the proper one.
+        if image_loader is None:
+            for format in image_formats:
+                if format in BasicImageFolder.DEFAULT_LOADER_FORMATS:
+                    pass
+                elif format in BasicImageFolder.PIL_LOADER_FORMATS:
+                    use_pil_loader = True
+                else:
+                    raise ValueError(f"Format {format} not supported!")
+
+        use_pil_loader = use_pil_loader or force_pil_loader
+
+        # roots
+        self.root = root
+        self.target_root = target_root
+
+        # formats allowed
+        self.image_formats = image_formats
+        self.target_formats = target_formats
+
+        # transforms
+        try:
+            self.transform = torch.jit.script(transform)
+        except Exception:
+            self.transform = transform
+        
+        try:
+            self.target_transform = torch.jit.script(target_transform)
+        except Exception:
+            self.target_transform = target_transform
+
+        # loaders
+        if image_loader is not None:
+            self.image_loader = image_loader
+        else:
+            if use_pil_loader:
+                self.image_loader = get_pil_loader()
+            elif len(image_formats) == 1 and image_formats[0] in ["jpg", "jpeg"]:
+                try:
+                    self.image_loader = get_turbojpg_loader()
+                except Exception:
+                    self.image_loader = get_torch_loader()
+            else:
+                self.image_loader = get_torch_loader()
+
+        self.target_loader = target_loader
+
+        try:
+            self.image_loader = torch.jit.script(self.image_loader)
+        except Exception:
+            pass
+
+        try:
+            self.target_loader = torch.jit.script(self.target_loader)
+        except Exception:
+            pass
+
+        # setup dataset
+        self._get_classes()
+
+        if self.target_root is not None:
+            self._get_samples_and_targets()
+        else:
+            self._get_samples()
+
+
+    def __len__(self) -> int:
+        """ Returns the length of the dataset. """
+        return len(self.samples)
+
+
+    def n_classes(self) -> int:
+        """ Returns the number of classes in the dataset. """
+        return len(self.classes)
+    
+
+    def _check_image(self, path: str) -> bool:
+        """ Returns True if path has a valid format for images. """
+
+        if self.image_formats is None:
+            return True
+
+        _, file_extension = os.path.splitext(path)
+        file_extension = file_extension[1:] # remove . from extension
+
+        return file_extension in self.image_formats
+
+
+    def _get_classes(self):
+        """ Setup of classes and class2idx. """
+
+        self.classes = sorted(get_dir_names(self.root))
+        self.class2idx = {cl : idx for idx, cl in enumerate(self.classes)}
+
+
+    def _get_samples(self):
+        """ Setup samples (for image classification). """
+
+        self.samples = []
+        self.targets = []
+
+        for class_name, class_idx in self.class2idx.items():
+            
+            # path to current class for images and targets
+            class_image_path  = os.path.join(self.root, class_name)
+
+            for image in sorted(get_file_names(class_image_path)):  
+
+                image_path = os.path.join(class_image_path, image)
+
+                if self._check_image(image_path):
+                    self.samples.append(image_path)
+                    self.targets.append(class_idx)
+
+
+    def _get_samples_and_targets(self, warn_mismatch: Optional[bool] = True):
+        """
+            Setup both samples and targets (for all tasks but image classification).
+
+            Args:
+                warn_mismatch (bool, optional): True to warn user when a file mismatch is
+                found.
+        """
+
+        self.samples = []
+        self.targets = []
+
+        for class_name in self.class2idx.keys():
+            
+            # path to current class for images and targets
+            class_image_path  = os.path.join(self.root, class_name)
+            class_target_path = os.path.join(self.target_root, class_name)
+
+            matching_files = match_file_names(path1=class_image_path,
+                                              path2=class_target_path, 
+                                              formats_1=self.image_formats, 
+                                              formats_2=self.target_formats, 
+                                              warn_mismatch=warn_mismatch)
+
+            for image, target in matching_files:
+
+                image_path = os.path.join(class_image_path, image)
+                target_path = os.path.join(class_target_path, target)
+                
+                self.samples.append(image_path)
+                self.targets.append(target_path)
+    
+
+    def __getitem__(self, index) -> Tuple[Any, Any]:
+        
+        image = self.image_loader(self.samples[index])
+        
+        if self.target_root is not None and self.target_loader is not None:
+            label = self.target_root(self.targets[index])
+        else:
+            label = self.targets[index]
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        if self.target_transform is not None:
+            label = self.target_transform(label)
+
+        return image, label
+
+    def writeLMDB(self,
+                  path: str,
+                  num_processes: Optional[int] = 1,
+                  map_size: Optional[int] = 100000000,
+                  target_loader: Optional[Callable[[T], bytes]] = None, 
+                  image_format: Optional[str] = "jpg", 
+                  convert_other_img_formats: Optional[bool] = True, 
+                  image_size: Optional[Tuple[int, int]] = None, 
+                  interpolation: Optional[int] = cv2.INTER_CUBIC,
+                  warn_ignored: Optional[bool] = False):
+
+        write(dataset=self, 
+              path=path,
+              num_processes=num_processes,
+              map_size=map_size,
+              target_loader=target_loader,
+              image_format=image_format,
+              convert_other_img_formats=convert_other_img_formats,
+              image_size=image_size,
+              interpolation=interpolation,
+              warn_ignored=warn_ignored)
+
+
+class LMDBImageFolder(Dataset):
+
+    def __init__(self,
+                 lmdb_path: str,
+                 image_decoder: Optional[Callable[[bytes], torch.Tensor]] = None,
+                 target_decoder: Optional[Callable[[bytes], Any]] = None,
+                 transform: Optional[nn.Module] = None,
+                 target_transform: Optional[Callable[[Any], Any]] = None):
+
+        self.path = lmdb_path
+        self.image_decoder = image_decoder
+        self.target_decoder = target_decoder
+        self.lmdb_env = lmdb.open(lmdb_path, readonly=True, lock=False)
+        self.length, self.classes, self.classes2idx, self.img_format = read_info(self.path)
+        self.txn = None
+
+        if self.image_decoder is None:
+            if self.img_format != "jpg" and self.img_format != "jpeg":
+                self.image_decoder = get_torch_decoder()
+            else:
+                try:
+                    self.image_decoder = get_turbojpg_decoder()
+                except Exception:
+                    self.image_decoder = get_torch_decoder()
+        
+        if self.target_decoder is None:
+            self.target_decoder = lambda x: int(x)
+
+
+        # decoders
+        try:
+            self.image_decoder = torch.jit.script(self.image_decoder)
+        except Exception:
+            pass
+
+        try:
+            self.target_decoder = torch.jit.script(self.target_decoder)
+        except Exception:
+            pass
+
+
+        # transforms
+        try:
+            self.transform = torch.jit.script(transform)
+        except Exception:
+            self.transform = transform
+        
+        try:
+            self.target_transform = torch.jit.script(target_transform)
+        except Exception:
+            self.target_transform = target_transform
+
+
+    def _initLMDB(self):
+        self.txn = self.lmdb_env.begin(write=False)
+
+
+    def __len__(self):
+        return self.length
+
+
+    def __getitem__(self, index) -> Tuple[Any, Any]:
+
+        if self.txn is None:    
+            self._initLMDB()
+
+        sample = self.txn.get(f"X{index}".encode())
+        target = self.txn.get(f"Y{index}".encode())
+
+        sample = self.image_decoder(sample)
+        target = self.target_decoder(target)
+
+        if self.transform is not None:
+            sample = self.transform(sample)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return sample, target
 
 
 class AdvanceImageFolder(ImageFolder):
