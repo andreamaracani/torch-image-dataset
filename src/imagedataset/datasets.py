@@ -6,10 +6,11 @@ from math import ceil, floor
 import copy
 import time
 from collections import OrderedDict
+from unittest import loader
 
 
 import torch
-
+import numpy as np
 from torch.utils.data import DataLoader, Sampler, Dataset
 from torchvision.datasets import ImageFolder
 import torch.nn as nn
@@ -20,7 +21,8 @@ from types import SimpleNamespace
 from typing import Optional, Union, Callable, Tuple, Sequence, TypeVar, Any
 from .utils import get_dir_names, get_file_names, match_file_names
 from .write_database import *
-from .loaders import *
+from .image_loaders import get_decoder_by_name, get_loader_by_name, get_loader_resize_by_name
+from .data_loaders import CudaLoader, fast_collate
 
 X, Y = TypeVar('X'), TypeVar('Y')
 
@@ -28,6 +30,7 @@ X, Y = TypeVar('X'), TypeVar('Y')
 class BasicImageFolder(Dataset):
 
     """
+        TODO: modify doc
         A simple dataset of images. It should be structured as (names are arbitrary):
     
           root/
@@ -56,22 +59,6 @@ class BasicImageFolder(Dataset):
         For example:
             root_img/dog/dog1.jpg <=> root_lab/dog/dog1.xml is a correct pair.
 
-
-        Note on image loader:
-
-            - if `image_loader` is specified it will be used.
-
-            - if `image_loader` is None there are two possibilities:
-
-                1) if `force_pil_loader` is False and the image formats are PNG, JPG or 
-                   JPEG, than the DEFAULT LOADER is used: it reads images from disk and 
-                   returns torch.Tensors of torch.float32 in the range [0, 1].
-
-                2) if force_pil_loader is True or if there are formats not compatible 
-                   with the default loader, than PIL LOADER is used and it returns PIL 
-                   images.
-
-
         Args:
             root (string): the path to the root directory of images.
             target_root (string, optional): the path to the root of directory of labels.
@@ -97,85 +84,81 @@ class BasicImageFolder(Dataset):
             To load labels a label_loader is mandatory, since is None by default.
     """
 
-    DEFAULT_LOADER_FORMATS = ["png", "jpg", "jpeg"]
-    PIL_LOADER_FORMATS = ["png", "jpg", "jpeg", "ppm", "bmp", "pgm", "tif", "tiff", 
-                          "webp"]
-
-
     def __init__(self, 
                  root: str,
                  target_root: Optional[str] = None,
-                 transform: Optional[Callable[[X], torch.Tensor]] = None,
+                 transform: Optional[Callable[[X], Any]] = None,
                  target_transform: Optional[Callable[[Y], Any]] = None,
-                 image_loader: Optional[Callable[[str], X]] = None,
+                 image_loader: Optional[Union[str, Callable[[str], X]]] = "pil",
+                 image_loader_resize: Optional[Tuple[int, int]] = None,
                  target_loader: Optional[Callable[[str], Y]] = None,
-                 force_pil_loader: Optional[bool] = False,
-                 image_formats: Optional[list[str]] = ["png", "jpg", "jpeg"],
-                 target_formats: Optional[list[str]] = None):
+                 filter_image_formats: Optional[list[str]] = ["png", "jpg", "jpeg"],
+                 filter_target_formats: Optional[list[str]] = None):
 
-        if target_loader is None and target_root is not None:
+        if (target_loader is None) and (target_root is not None):
             raise ValueError("Target root selected but target loader is None.")
 
-
-        # do we need to use pil loader?
-        use_pil_loader = False
-
-        # check formats for default loaders and select the proper one.
-        if image_loader is None:
-            for format in image_formats:
-                if format in BasicImageFolder.DEFAULT_LOADER_FORMATS:
-                    pass
-                elif format in BasicImageFolder.PIL_LOADER_FORMATS:
-                    use_pil_loader = True
-                else:
-                    raise ValueError(f"Format {format} not supported!")
-
-        use_pil_loader = use_pil_loader or force_pil_loader
 
         # roots
         self.root = root
         self.target_root = target_root
 
+        # do we need to read targets?
+        self.read_targets = self.target_root is not None
+
         # formats allowed
-        self.image_formats = image_formats
-        self.target_formats = target_formats
+        self.image_formats = set(filter_image_formats)
+        self.target_formats = set(filter_target_formats)
 
         # transforms
-        try:
-            self.transform = torch.jit.script(transform)
-        except Exception:
-            self.transform = transform
-        
-        try:
-            self.target_transform = torch.jit.script(target_transform)
-        except Exception:
-            self.target_transform = target_transform
+        self.transform = transform
+        self.target_transform = target_transform
+
+        if self.transform is None:
+            self.transform =  lambda x: np.asarray(x, dtype=np.uint8)
 
         # loaders
-        if image_loader is not None:
+
+        # loader from string
+        if isinstance(image_loader, str):
+
+            self.image_loader = get_loader_by_name(image_loader)
+
+            # set native resize
+            if image_loader_resize is not None:
+                resize_fnc = get_loader_resize_by_name(image_loader)
+                self.image_loader = lambda x: resize_fnc(self.image_loader(x))
+
+        # custom loader
+        elif isinstance(image_loader, Callable):
             self.image_loader = image_loader
+            if image_loader_resize is not None:
+                warnings.warn("Custom loader, not resizing with loader resize functions.")
+
+        # wrong loader
         else:
-            if use_pil_loader:
-                self.image_loader = get_pil_loader()
-            elif len(image_formats) == 1 and image_formats[0] in ["jpg", "jpeg"]:
-                try:
-                    self.image_loader = get_turbojpg_loader()
-                except Exception:
-                    self.image_loader = get_torch_loader()
-            else:
-                self.image_loader = get_torch_loader()
+            msg = f"image loader should be a str or a Callable, got {type(image_loader)}."
+            raise ValueError(msg)
+        
+        # target loader
+        if isinstance(target_loader, Callable) or (target_loader is None):
+            self.target_loader = target_loader
+        else:
+            msg = f"target loader should be a Callable or None, got {type(target_loader)}."
+            raise ValueError(msg)
 
-        self.target_loader = target_loader
-
-        try:
-            self.image_loader = torch.jit.script(self.image_loader)
-        except Exception:
-            pass
-
-        try:
-            self.target_loader = torch.jit.script(self.target_loader)
-        except Exception:
-            pass
+        
+        # # transforms (try to compile)
+        # try:
+        #     self.transform = torch.jit.script(transform)
+        # except Exception:
+        #     self.transform = transform
+        
+        # # transforms (try to compile)
+        # try:
+        #     self.target_transform = torch.jit.script(target_transform)
+        # except Exception:
+        #     self.target_transform = target_transform
 
         # setup dataset
         self._get_classes()
@@ -272,8 +255,8 @@ class BasicImageFolder(Dataset):
         
         image = self.image_loader(self.samples[index])
         
-        if self.target_root is not None and self.target_loader is not None:
-            label = self.target_root(self.targets[index])
+        if self.read_targets:
+            label = self.target_loader(self.targets[index])
         else:
             label = self.targets[index]
 
@@ -284,6 +267,36 @@ class BasicImageFolder(Dataset):
             label = self.target_transform(label)
 
         return image, label
+
+
+    def dataloader(self,
+                   cuda: Optional[bool] = True,
+                   mean: Optional[tuple] = None,
+                   std: Optional[tuple] = None,
+                   fp16: Optional[bool] = False,
+                   batch_size: Optional[int] = 1,
+                   shuffle: bool = False, 
+                   sampler: Optional[Sampler[int]] = None,
+                   batch_sampler: Optional[Sampler[Sequence[int]]] = None,
+                   num_workers: int = 0,
+                   pin_memory: bool = False, 
+                   drop_last: bool = False) -> Union[DataLoader, CudaLoader]:
+    
+        dataloader = DataLoader(self, 
+                                batch_size=batch_size, 
+                                shuffle=shuffle, 
+                                sampler=sampler, 
+                                batch_sampler=batch_sampler, 
+                                num_workers=num_workers, 
+                                pin_memory=pin_memory, 
+                                drop_last=drop_last,
+                                collate_fn=fast_collate)
+
+        if not cuda:
+            return dataloader
+
+        return CudaLoader(loader=loader, mean=mean, std=std, fp16=fp16)
+
 
     def writeLMDB(self,
                   path: str,
@@ -387,6 +400,7 @@ class LMDBImageFolder(Dataset):
             target = self.target_transform(target)
 
         return sample, target
+
 
 
 class AdvanceImageFolder(ImageFolder):
