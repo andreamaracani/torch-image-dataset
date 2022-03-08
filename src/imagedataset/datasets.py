@@ -21,9 +21,9 @@ from types import SimpleNamespace
 from typing import Optional, Union, Callable, Tuple, Sequence, TypeVar, Any
 from .utils import get_dir_names, get_file_names, match_file_names
 from .write_database import *
-from .image_loaders import get_decoder_by_name, get_loader_by_name, get_loader_resize_by_name
-from .data_loaders import CudaLoader, fast_collate
-
+from .image_loaders import get_decoder_by_name, get_loader_by_name
+from .data_loaders import CudaLoader, get_collate
+from . import LOADERS
 X, Y = TypeVar('X'), TypeVar('Y')
 
 
@@ -86,6 +86,7 @@ class BasicImageFolder(Dataset):
 
     def __init__(self, 
                  root: str,
+                 dataset_name: Optional[str] = None,
                  target_root: Optional[str] = None,
                  transform: Optional[Callable[[X], Any]] = None,
                  target_transform: Optional[Callable[[Y], Any]] = None,
@@ -98,43 +99,40 @@ class BasicImageFolder(Dataset):
         if (target_loader is None) and (target_root is not None):
             raise ValueError("Target root selected but target loader is None.")
 
+        if isinstance(image_loader, str):
+            assert image_loader in LOADERS,\
+            f"Image_loader should be a Callable or a str in {LOADERS}, found '{image_loader}'."
 
         # roots
         self.root = root
         self.target_root = target_root
+        self.dataset_name = dataset_name
 
         # do we need to read targets?
         self.read_targets = self.target_root is not None
 
         # formats allowed
-        self.image_formats = set(filter_image_formats)
-        self.target_formats = set(filter_target_formats)
+        self.image_formats  = set(filter_image_formats)  if filter_image_formats \
+                                                         else None
+        self.target_formats = set(filter_target_formats) if filter_target_formats \
+                                                         else None
 
         # transforms
         self.transform = transform
         self.target_transform = target_transform
 
-        if self.transform is None:
-            self.transform =  lambda x: np.asarray(x, dtype=np.uint8)
 
         # loaders
+        self.loader_name = image_loader if image_loader else "custom"
 
         # loader from string
         if isinstance(image_loader, str):
-
-            self.image_loader = get_loader_by_name(image_loader)
-
-            # set native resize
-            if image_loader_resize is not None:
-                resize_fnc = get_loader_resize_by_name(image_loader)
-                self.image_loader = lambda x: resize_fnc(self.image_loader(x))
-
+            self.image_loader = get_loader_by_name(image_loader, image_loader_resize)
         # custom loader
         elif isinstance(image_loader, Callable):
             self.image_loader = image_loader
             if image_loader_resize is not None:
                 warnings.warn("Custom loader, not resizing with loader resize functions.")
-
         # wrong loader
         else:
             msg = f"image loader should be a str or a Callable, got {type(image_loader)}."
@@ -168,6 +166,9 @@ class BasicImageFolder(Dataset):
         else:
             self._get_samples()
 
+    def __repr__(self):
+        return f'<{self.__class__.__name__} len={self.__len__()} ' \
+             + f'loader={self.loader_name} name={self.dataset_name}>'
 
     def __len__(self) -> int:
         """ Returns the length of the dataset. """
@@ -254,7 +255,7 @@ class BasicImageFolder(Dataset):
     def __getitem__(self, index) -> Tuple[Any, Any]:
         
         image = self.image_loader(self.samples[index])
-        
+
         if self.read_targets:
             label = self.target_loader(self.targets[index])
         else:
@@ -266,7 +267,7 @@ class BasicImageFolder(Dataset):
         if self.target_transform is not None:
             label = self.target_transform(label)
 
-        return image, label
+        return SimpleNamespace(image=image, label=label)
 
 
     def dataloader(self,
@@ -274,6 +275,7 @@ class BasicImageFolder(Dataset):
                    mean: Optional[tuple] = None,
                    std: Optional[tuple] = None,
                    fp16: Optional[bool] = False,
+                   channels_last: Optional[bool] = False,
                    batch_size: Optional[int] = 1,
                    shuffle: bool = False, 
                    sampler: Optional[Sampler[int]] = None,
@@ -281,7 +283,13 @@ class BasicImageFolder(Dataset):
                    num_workers: int = 0,
                    pin_memory: bool = False, 
                    drop_last: bool = False) -> Union[DataLoader, CudaLoader]:
-    
+
+        if channels_last:
+            memory_format = torch.channels_last
+        else:
+            memory_format = torch.contiguous_format
+
+        collate_fn = get_collate(memory_format)
         dataloader = DataLoader(self, 
                                 batch_size=batch_size, 
                                 shuffle=shuffle, 
@@ -290,12 +298,16 @@ class BasicImageFolder(Dataset):
                                 num_workers=num_workers, 
                                 pin_memory=pin_memory, 
                                 drop_last=drop_last,
-                                collate_fn=fast_collate)
+                                collate_fn=collate_fn)
 
         if not cuda:
+            if std is not None or mean is not None:
+                msg = "Currently, just cuda dataloader normalizes automatically. " \
+                    + "Mean and std are not used in cpu loader."
+                warnings.warn(msg)
             return dataloader
 
-        return CudaLoader(loader=loader, mean=mean, std=std, fp16=fp16)
+        return CudaLoader(loader=dataloader, mean=mean, std=std, fp16=fp16)
 
 
     def writeLMDB(self,

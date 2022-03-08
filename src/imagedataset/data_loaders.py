@@ -11,12 +11,13 @@ from typing import Callable, List
 import random
 
 
+def get_collate(memory_format):
+    return lambda batch: fast_collate(batch, memory_format)
+
 def fast_collate(batch: List[SimpleNamespace], memory_format) -> SimpleNamespace:
-
-    images = [sample.image for sample in batch]
-
+    
     # collate targets
-
+    
     # case classification -> ints
     if isinstance(batch[0].label, int):
         targets = torch.tensor([sample.label for sample in batch], dtype=torch.int64)
@@ -24,11 +25,9 @@ def fast_collate(batch: List[SimpleNamespace], memory_format) -> SimpleNamespace
     # case segmentation -> imgs (np.ndarray)
     elif isinstance(batch[0].label, np.ndarray):
         targets = [sample.label for sample in batch]
-        w = targets[0].size[0]
-        h = targets[0].size[1]
-        c = targets[0].size[2]
+        w, h, c = targets[0].shape
 
-        targets_tensor = torch.zeros((len(images), c, h, w), dtype=torch.uint8) \
+        targets_tensor = torch.zeros((len(batch), c, h, w), dtype=torch.uint8) \
                          .contiguous(memory_format=memory_format)
                          
         for i, target in enumerate(targets):
@@ -47,11 +46,11 @@ def fast_collate(batch: List[SimpleNamespace], memory_format) -> SimpleNamespace
         msg = f"Collate of targets {type(batch[0].label)} not implemented!"
         raise NotImplementedError(msg)
 
-    # collate images
 
-    w = images[0].size[0]
-    h = images[0].size[1]
-    c = images[0].size[2]
+    # collate images
+    images = [sample.image for sample in batch]
+
+    w, h, c = images[0].shape
 
     images_tensor = torch.zeros((len(images), c, h, w), dtype=torch.uint8) \
                          .contiguous(memory_format=memory_format)
@@ -76,11 +75,19 @@ class CudaLoader:
                  fp16=False):
 
         self.dataloader = loader
-        self.mean = torch.tensor([x * 255 for x in mean]).cuda().view(1, 3, 1, 1)
-        self.std = torch.tensor([x * 255 for x in std]).cuda().view(1, 3, 1, 1)
+
+        self.mean = None
+        self.std  = None
+        self.normalize = False
+
+        if mean is not None and std is not None:
+            self.mean = torch.tensor([x * 255 for x in mean]).cuda().view(1, 3, 1, 1)
+            self.std = torch.tensor([x * 255 for x in std]).cuda().view(1, 3, 1, 1)
+            self.normalize = True
+
         self.fp16 = fp16
 
-        if fp16:
+        if fp16 and self.normalize:
             self.mean = self.mean.half()
             self.std = self.std.half()
 
@@ -89,17 +96,24 @@ class CudaLoader:
         stream = torch.cuda.Stream()
         first = True
 
-        for next_input, next_target in self.loader:
+        for batch in self.dataloader:
+
+            next_input, next_target = batch.image, batch.label
+
             with torch.cuda.stream(stream):
                 next_input = next_input.cuda(non_blocking=True)
                 next_target = next_target.cuda(non_blocking=True)
-                if self.fp16:
+                if self.fp16 and self.normalize:
                     next_input = next_input.half().sub_(self.mean).div_(self.std)
-                else:
+                elif self.fp16:
+                    next_input = next_input.half()
+                elif self.normalize:
                     next_input = next_input.float().sub_(self.mean).div_(self.std)
+                else:
+                    next_input = next_input.float()
 
             if not first:
-                yield input, target
+                yield SimpleNamespace(image=input, label=target)
             else:
                 first = False
 
@@ -107,7 +121,8 @@ class CudaLoader:
             input = next_input
             target = next_target
 
-        yield input, target
+        yield SimpleNamespace(image=input, label=target)
+
 
     def __len__(self):
         return len(self.loader)
