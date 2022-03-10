@@ -28,6 +28,8 @@ The image loaders available are: ```LoaderPIL``` (from pillow), ```LoaderOpenCV`
 To initialize a loader:
 
 ```
+  from imagedataset import LoaderOpenCV, Interpolation
+  
   size = (224, 224)
   loader = LoaderOpenCV(size=size, interpolation=Interpolation.CV_AREA)
 ```
@@ -90,10 +92,10 @@ The dataset is initialized by indicating the root directory.
 Additionally, the name of the dataset can be indicated and it is possible to load just a subset of the dataset. ```load_percentage``` specifies the percentage of images to load (randomly picked without repetitions) or ```indices``` can be used to select specific indices of the dataset.
 
 ```
-  dataset = AdvanceImageFolder(root="path/to/mydataset/",
-                               name="incredible_dataset",
-                               load_percentage=1.,
-                               indices=None)
+  dataset = id.AdvanceImageFolder(root="path/to/mydataset/",
+                                  name="incredible_dataset",
+                                  load_percentage=1.,
+                                  indices=None)
 ```
 
 The return type of the dataset is ```types.SimpleNamespace``` with the following fields:
