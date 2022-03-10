@@ -95,3 +95,23 @@ def match_file_names(path1: str,
         i2 += 1
 
     return pairs
+
+
+import numpy as np
+from io import BytesIO
+
+
+def array_to_bytes(x: np.ndarray) -> bytes:
+    np_bytes = BytesIO()
+    np.save(np_bytes, x, allow_pickle=True)
+    return np_bytes.getvalue()
+
+
+def bytes_to_array(b: bytes) -> np.ndarray:
+    np_bytes = BytesIO(b)
+    array = np.load(np_bytes, allow_pickle=True)
+
+    if len(array.shape) == 0 and array.dtype == 'int':
+        return int(array)
+    
+    return array

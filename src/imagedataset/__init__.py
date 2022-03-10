@@ -1,6 +1,5 @@
-LOADERS  = ["pil", "opencv", "turbojpeg", "accimage"]
-DECODERS = ["pil", "opencv", "turbojpeg", "accimage"]
-
-from .datasets import AdvanceImageFolder, BasicImageFolder, LMDBImageFolder
-from .write_database import read_info
-from .benchmark import * 
+from .datasets import BasicImageFolder, AdvancedImageFolder, from_database
+from .imageloaders import *
+from .imagedecoders import *
+from .interpolations import Interpolation
+from .imageloaders import *
