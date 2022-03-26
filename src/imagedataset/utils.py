@@ -1,15 +1,16 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import warnings
 import os
 
-def get_dir_names(path: str) -> list[str]:
+
+def get_dir_names(path: str) -> List[str]:
     """ Returns the dir names inside directory specified by path. """
 
     return [dir_name for dir_name in os.listdir(path) if \
             os.path.isdir(os.path.join(path, dir_name))]
 
 
-def get_file_names(path: str) -> list[str]:
+def get_file_names(path: str) -> List[str]:
     """ Returns the file names inside directory specified by path. """
 
     return [file_name for file_name in os.listdir(path) if \
@@ -18,9 +19,9 @@ def get_file_names(path: str) -> list[str]:
 
 def match_file_names(path1: str,
                      path2: str,
-                     formats_1: Optional[list[str]] = None,
-                     formats_2: Optional[list[str]] = None, 
-                     warn_mismatch: Optional[bool] = False) -> list[Tuple[str, str]]:
+                     formats_1: Optional[List[str]] = None,
+                     formats_2: Optional[List[str]] = None, 
+                     warn_mismatch: Optional[bool] = False) -> List[Tuple[str, str]]:
     """
         Find matching files not considering extensions.
         In particular a match when two files:

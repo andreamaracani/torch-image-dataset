@@ -1,4 +1,5 @@
 from __future__ import annotations
+import warnings
 
 from types import SimpleNamespace
 from typing import Optional, Union,  Tuple, Sequence, List
@@ -16,6 +17,8 @@ import cv2
 import torch
 from torch.utils.data import DataLoader, Sampler, Dataset
 
+from imagedataset.enums import OutputFormat
+
 from .utils import (
     get_dir_names, 
     get_file_names, 
@@ -24,20 +27,26 @@ from .utils import (
     bytes_to_array
 )
 
-from .dataloaders import CudaLoader, get_collate
+from .dataloaders import CpuLoader, CudaLoader, get_collate
 from .operations import  ImageLoader, FileLoader
 from .imageloaders import LoaderPIL
+from enum import Enum
 
 
-def from_database(path, load_labels=True) -> Union[BasicImageFolder, AdvancedImageFolder]:
+def from_database(path, 
+                  image_size: Optional[Tuple[int,int]] = None, 
+                  load_labels: Optional[bool] = True) \
+                      -> Union[BasicImageFolder, AdvancedImageFolder]:
     """
         NOTE: requires `lmdb` installed
         Get a BasicImageFolder or an AdvanceImageFolder from a LMDB database file.
 
         Args:
             path (str): the path to the LMDB.
-            load_labels (bool, optional): True to load labels to RAM, False to keep labels
-            inside the database.
+            image_size (Tuple, optional): A new image size for database images, None to
+            keep original image size.
+            load_labels (bool, optional): True to load labels to RAM, False to keep 
+            labels inside the database.
     """
 
     import lmdb
@@ -46,16 +55,31 @@ def from_database(path, load_labels=True) -> Union[BasicImageFolder, AdvancedIma
     txn = env.begin(write=False)
 
     dataset = pickle.loads(txn.get('__object__'.encode()))
+    dataset.loaded_labels = None
 
     if load_labels:
-        dataset.loaded_labels = []
+        labels = []
         for i in range(len(dataset)):
-            label = bytes_to_array(txn.get(f"label{i}".encode()))
-            dataset.loaded_labels.append(label)  
+            original_index = dataset.ids[i]
+            label = int(bytes_to_array(txn.get(f"label{original_index}".encode())))
+            labels.append(label)  
+        dataset.loaded_labels = labels
 
     dataset._initLMDB_env(path)
 
+    if image_size is not None:
+        dataset.image_size = image_size
+
     return dataset
+
+
+class DatasetState(Enum):
+    DATABASE_NOT_AVAILABLE  = 0
+    DATABASE_NUMPY          = 1
+    DATABASE_JPG            = 2
+    RAM_NOT_AVAILABLE       = 3
+    RAM_NUMPY               = 4
+    RAM_JPG                 = 5
 
 
 class BasicImageFolder(Dataset):
@@ -116,9 +140,17 @@ class BasicImageFolder(Dataset):
                  dataset_name: Optional[str] = None,
                  seed: Optional[int] = 1234):
 
+        self.database_state = DatasetState.DATABASE_NOT_AVAILABLE
+        self.ram_state      = DatasetState.RAM_NOT_AVAILABLE
+
+        # Current image size of the dataset.
+        self._image_size         = image_loader.size
+        self.ram_image_size      = None
+        self.database_image_size = None
+    
         # True if we have external labels, False if the labels are the names of folders.
         self.external_labels = label_root is not None
-        self.from_database = False
+
 
         # check load_percentage 
         if load_percentage and not (0 <= load_percentage <= 1):
@@ -154,19 +186,17 @@ class BasicImageFolder(Dataset):
         self.image_loader  = image_loader
         self.label_loader  = label_loader
         self.image_decoder = image_loader.decoder(keep_resizer=False)
+        self.image_resizer = None
         
 
         # SETUP DATASET
-        
         self.classes       = None  # class names list
         self.class2index   = None  # dict {class_name:index}
         self.images        = None  # list of the paths to images
         self.labels        = None  # list of the paths to labels
         self.loaded_images = None  # list of images (loaded)
         self.loaded_labels = None  # list of labels (loaded)
-        self.images_loaded_as_numpy = False # True if images have been loaded as numpy.
-                                            # False if images have been loaded as bytes.
-        self.images_database_as_numpy = False
+
 
         # fill the fields above...
         self._setup_dataset()
@@ -207,6 +237,85 @@ class BasicImageFolder(Dataset):
                 self.loaded_images = [self.loaded_images[i] for i in keep_indices]
             if self.loaded_labels is not None:
                 self.loaded_labels = [self.loaded_labels[i] for i in keep_indices]
+
+
+    def get_state(self):
+        return self.ram_state.name, self.database_state.name
+
+
+    @property
+    def image_size(self) -> Tuple[int, int]:
+        """ Get the current image size. """
+        return self._image_size
+    
+    
+    @image_size.setter
+    def image_size(self, image_size: Tuple[int, int]):
+        """ Set a new image size. """
+        
+
+        if (self.ram_state != DatasetState.RAM_NOT_AVAILABLE) and\
+            (image_size != self.ram_image_size) and image_size is not None:
+   
+            from_size = self.ram_image_size if self.ram_image_size is not None else\
+                        "(*, *)"
+            msg = f"RAM images will be resized from {from_size} to {image_size}!"
+            warnings.warn(msg)
+
+        elif (self.database_state != DatasetState.DATABASE_NOT_AVAILABLE) and\
+            (image_size != self.database_image_size) and image_size is not None:
+
+            from_size = self.database_image_size if self.database_image_size is not None\
+                                                 else "(*, *)"
+            msg = f"Database images will be resized from {from_size} to {image_size}!"
+            warnings.warn(msg)
+        
+        # deepcopy loaders to set new image size (since subsetting/split makes just
+        # shallow copies and it is possible that the loaders are shared among many
+        # instances of dataset).
+        self.image_loader  = copy.deepcopy(self.image_loader)
+        self.image_loader.size  = image_size # set the new image_size
+
+        # create the new decoder and resizer
+        self.image_decoder = self.image_loader.decoder(keep_resizer=True)
+
+        if self.ram_state == DatasetState.RAM_JPG:
+            # images in RAM as JPG -> use decoder
+            if image_size != self.ram_image_size:
+                self.image_decoder.size = image_size
+            else:
+                self.image_decoder.size = None
+
+        elif self.ram_state == DatasetState.RAM_NUMPY:
+            # images in RAM as NUMPY -> use resizer
+            self.image_resizer = self.image_loader.resizer()
+            if image_size != self.ram_image_size:
+                self.image_resizer.size = image_size
+            else:
+                self.image_resizer.size = None
+
+        elif self.database_state == DatasetState.DATABASE_JPG:
+            # images in DB as JPG -> use decoder
+            if image_size != self.database_image_size:
+                self.image_decoder.size = image_size
+            else:
+                self.image_decoder.size = None
+
+        elif self.database_state == DatasetState.DATABASE_NUMPY:
+            # images in DS as NUMPY -> use resizer
+            self.image_resizer = self.image_loader.resizer()
+            if image_size != self.database_image_size:
+                self.image_resizer.size = image_size
+            else:
+                self.image_resizer.size = None
+
+        self._image_size = image_size
+
+
+    def set_loader(self, loader: ImageLoader):
+        """Set the loader."""
+        self.image_loader = loader
+        self.image_size = loader.size
 
 
     def subset(self, 
@@ -333,8 +442,40 @@ class BasicImageFolder(Dataset):
 
     def __repr__(self):
         """ Returns the repr of this object. """
-        return f'<{self.__class__.__name__} len={self.__len__()} ' \
-             + f'name={self.dataset_name}>'
+
+        repr = f"<{self.__class__.__name__}[{self.dataset_name}, {len(self)}] "
+
+        if self.ram_state == DatasetState.RAM_NUMPY:
+            source = "RAM_NP"
+            image_size = str(self.ram_image_size) if self.ram_image_size is not None else\
+                "(*, *)"
+            reader = str(self.image_resizer)
+        
+        elif self.ram_state == DatasetState.RAM_JPG:
+            source = "RAM_JPG"
+            image_size = str(self.ram_image_size) if self.ram_image_size is not None else\
+                "(*, *)"
+            reader = str(self.image_decoder)
+
+        elif self.database_state == DatasetState.DATABASE_NUMPY:
+            source = "DB_NP"
+            image_size = str(self.database_image_size) if self.database_image_size\
+                        is not None else "(*, *)"
+            reader = str(self.image_resizer)
+
+        elif self.database_state == DatasetState.DATABASE_JPG:
+            source = "DB_JPG"
+            image_size = str(self.database_image_size) if self.database_image_size\
+                        is not None else "(*, *)"
+            reader = str(self.image_decoder)
+            loader, decoder = "", ""
+        else:
+            source = "DISK"
+            image_size = "(*, *)"
+            reader = str(self.image_loader)
+
+        repr += f"{source}{image_size} -> {reader}>"
+        return repr
 
 
     def __len__(self) -> int:
@@ -440,55 +581,95 @@ class BasicImageFolder(Dataset):
 
         """
 
-        # MODE: NOT DATABASE
-        if not self.from_database:
+        # LOAD IMAGE
 
-            # IMAGES 
-            if self.loaded_images is not None:                  # 1) NUMPY IMAGES (RAM)
-                if self.images_loaded_as_numpy:
-                    image = self.loaded_images[index]
-                else:                                           # 2) BYTES IMAGES (RAM)
-                    image = self.image_decoder(self.loaded_images[index])
-            else:                                               # 3) IMAGES (DISK)
-                image = self.image_loader(self.images[index])
+        # FROM RAM
+        if self.ram_state == DatasetState.RAM_JPG:
+            image = self.image_decoder(self.loaded_images[index])
+        elif self.ram_state == DatasetState.RAM_NUMPY:
+            image = self.loaded_images[index]
+            if self.image_resizer is not None:
+                image = self.image_resizer(image)
 
-            # LABELS
-            if self.loaded_labels is not None:                  # 1) LABELS (RAM)
-                label = self.loaded_labels[index]
-            else:                                               # 2) LABELS (DISK)
-                label = self.label_loader(self.labels[index])
-
-
-        # MODE: DATABASE
-        else:
-
+        # FROM DB
+        elif self.database_state == DatasetState.DATABASE_JPG:
             if self.txn is None:  
                 self._initLMDB_txn()
+            original_index = self.ids[index]
+            image = self.image_decoder(self.txn.get(f"image{original_index}".encode()))
 
-            # IMAGE
-            if self.loaded_images is not None:
-                if self.images_loaded_as_numpy:              # 1) NUMPY IMAGES (RAM)
-                    image = self.loaded_images[index]
-                else:                                        # 2) BYTES IMAGES (RAM)
-                    image = self.image_decoder(self.loaded_images[index])
-            else:
-                if self.images_database_as_numpy:            # 3) NUMPY IMAGES (DATABASE)
-                    image = bytes_to_array(self.txn.get(f"image{index}".encode()))
-                else:                                        # 4) BYTES IMAGES (DATABASE)
-                    image = self.image_decoder(self.txn.get(f"image{index}".encode()))
+        elif self.database_state == DatasetState.DATABASE_NUMPY:
+            if self.txn is None:  
+                self._initLMDB_txn()
+            original_index = self.ids[index]
+            image = bytes_to_array(self.txn.get(f"image{original_index}".encode()))
+            if self.image_resizer is not None:
+                image = self.image_resizer(image)
 
-            # LABEL
-            if self.loaded_labels is not None:               # 1) LABELS (RAM)
-                label = self.loaded_labels[index]
-            else:                                            # 2) LABELS (DATABASE)
-                label = bytes_to_array(self.txn.get(f"label{index}".encode()))
+        # FROM DISK
+        else:
+            image = self.image_loader(self.images[index])
 
+        # LOAD LABEL
+        if self.loaded_labels is not None:
+            label = self.loaded_labels[index]
+        elif self.database_state != DatasetState.DATABASE_NOT_AVAILABLE:
+            original_index = self.ids[index]
+            label = bytes_to_array(self.txn.get(f"label{original_index}".encode()))
+        else:
+            label = self.label_loader(self.labels[index])
+        
         return SimpleNamespace(image=image, label=label)
+
+        # # MODE: NOT DATABASE
+        # if not self.from_database:
+
+        #     # IMAGES 
+        #     if self.loaded_images is not None:                  # 1) NUMPY IMAGES (RAM)
+        #         if self.images_loaded_as_numpy:
+        #             image = self.loaded_images[index]
+        #         else:                                           # 2) BYTES IMAGES (RAM)
+        #             image = self.image_decoder(self.loaded_images[index])
+        #     else:                                               # 3) IMAGES (DISK)
+        #         image = self.image_loader(self.images[index])
+
+        #     # LABELS
+        #     if self.loaded_labels is not None:                  # 1) LABELS (RAM)
+        #         label = self.loaded_labels[index]
+        #     else:                                               # 2) LABELS (DISK)
+        #         label = self.label_loader(self.labels[index])
+
+
+        # # MODE: DATABASE
+        # else:
+
+        #     if self.txn is None:  
+        #         self._initLMDB_txn()
+
+        #     # IMAGE
+        #     if self.loaded_images is not None:
+        #         if self.images_loaded_as_numpy:              # 1) NUMPY IMAGES (RAM)
+        #             image = self.loaded_images[index]
+        #         else:                                        # 2) BYTES IMAGES (RAM)
+        #             image = self.image_decoder(self.loaded_images[index])
+        #     else:
+        #         if self.images_database_as_numpy:            # 3) NUMPY IMAGES (DATABASE)
+        #             image = bytes_to_array(self.txn.get(f"image{index}".encode()))
+        #         else:                                        # 4) BYTES IMAGES (DATABASE)
+        #             image = self.image_decoder(self.txn.get(f"image{index}".encode()))
+
+        #     # LABEL
+        #     if self.loaded_labels is not None:               # 1) LABELS (RAM)
+        #         label = self.loaded_labels[index]
+        #     else:                                            # 2) LABELS (DATABASE)
+        #         label = bytes_to_array(self.txn.get(f"label{index}".encode()))
+
+        # return SimpleNamespace(image=image, label=label)
 
 
     def load_ram(self,
                  numpy_images: Optional[bool] = False,
-                 num_workers: Optional[int] = 4):
+                 num_workers: Optional[int]   = 4) -> BasicImageFolder:
         """ 
             Loads to RAM the entire dataset.
 
@@ -496,18 +677,24 @@ class BasicImageFolder(Dataset):
                 numpy_images (bool, optioanl): True to load images as np.ndarray in 
                 memory (it will speed up loading but it consumes more memory).
                 num_workers (int, optional): The number of workers for the loading.
+            Returns:
+                self
         """
-
-        # keep track if images have been loaded as numpy
-        self.images_loaded_as_numpy = numpy_images
 
         # new lables/images loaded in memory (in lists).
         loaded_images = []
         loaded_labels = []
 
         # get a collate function that does not alter data and do not convert to tensor.
-        collate_fn = get_collate(to_tensor=False, 
-                                 images_last2first=False)
+        if self.external_labels:
+            label_format = OutputFormat.UNALTERED_UNIT8_NUMPY
+        else:
+            label_format = OutputFormat.UNALTERED_INT64_NUMPY
+
+        collate_fn = get_collate(image_format=OutputFormat.UNALTERED_UNIT8_NUMPY,
+                                 label_format=label_format,
+                                 other_fields_format=OutputFormat.UNALTERED_INT64_NUMPY,
+                                 memory_format=torch.contiguous_format)
 
         dataloader = DataLoader(self, 
                                 batch_size=1, 
@@ -526,18 +713,24 @@ class BasicImageFolder(Dataset):
             loaded_labels.append(batch.label[0])
 
         # set images
-        self.loaded_images = loaded_images
+        self.loaded_images   = loaded_images
+        self.ram_image_size = self._image_size
 
         # set labels
         self.loaded_labels = loaded_labels
 
+        # keep track if images have been loaded as numpy
+        self.ram_state = DatasetState.RAM_NUMPY if numpy_images else DatasetState.RAM_JPG
+
+        return self
 
     def cudaloader(self,
-                   mean: Optional[tuple] = None,
-                   std: Optional[tuple] = None,
-                   fp16: Optional[bool] = False,
-                   channels_last_shape: Optional[bool] = False,
-                   channels_last_memory: Optional[bool] = False,
+                   rank: Optional[int] = None,
+                   image_format: Optional[OutputFormat] = OutputFormat.NCHW_FLOAT32_TENSOR,
+                   label_format: Optional[OutputFormat] = OutputFormat.UNALTERED_INT64_TENSOR,
+                   image_mean: Optional[tuple] = None,
+                   image_std: Optional[tuple] = None,
+                   memory_format: Optional[torch.memory_format] = torch.contiguous_format,
                    batch_size: Optional[int] = 1,
                    shuffle: bool = False, 
                    sampler: Optional[Sampler[int]] = None,
@@ -548,25 +741,19 @@ class BasicImageFolder(Dataset):
 
         """ 
             NOTE:
-                images contain FLOATS32 or 16 without normalization, so their value will
-                be between 0 and 255.
-                With mean and std it is possible to normalize them.
+                only images are converted in range [0, 1] and they should be floats.
 
-            NOTE:
-                other tensors contain just uint8 or int64 integers.
-            
             Get a torch.utils.data.DataLoader object associated with this dataset 
             wrapped inside a CudaLoader with prefatching and fast load to gpu.
 
             Args:
-                mean (tuple, optional): the mean to subtract to images.
-                std (tuple, optional): the std to divide the images.
-                fp15 (bool, optional): True to convert to half precision.
-                channels_last_shape (bool, optioanl): True to return images with the 
-                channel-last shape, False oterwise.
-                channels_last_memory (bool, optional): True to return tensors with the 
-                memory in channel last format, False to return tensors with contiguos
-                memory format.
+                rank (int, optional): the local rank (device).
+                image_format (OutputFormat, optional): the image output format.
+                label_format (OutputFormat, optional): the label output format.
+                image_mean (tuple, optional): the mean to subtract to images.
+                image_std (tuple, optional): the std to divide the images.
+                memory_format (torch.memory_format, optional): the torch memory format
+                for tensors.
                 batch_size (int, optional): the batch size.
                 shuffle (bool, optional): True to shuffle indices.
                 sampler (Sampler, optional): a sampler for indices.
@@ -579,12 +766,14 @@ class BasicImageFolder(Dataset):
                 a CudaLoader
         """
 
-        if channels_last_memory:
-            memory_format = torch.channels_last
-        else:
-            memory_format = torch.contiguous_format
+        assert "TENSOR" in image_format.name and "FLOAT" in image_format.name,\
+        "image_format should be a TENSOR format of FLOAT"
 
-        collate_fn = get_collate(memory_format, not channels_last_shape, to_tensor=True)
+        collate_fn = get_collate(image_format=image_format, 
+                                 label_format=label_format,
+                                 other_fields_format=OutputFormat.UNALTERED_INT64_TENSOR, 
+                                 memory_format=memory_format)
+
         dataloader = DataLoader(self, 
                                 batch_size=batch_size, 
                                 shuffle=shuffle, 
@@ -594,32 +783,39 @@ class BasicImageFolder(Dataset):
                                 pin_memory=pin_memory, 
                                 drop_last=drop_last,
                                 collate_fn=collate_fn)
-        return CudaLoader(loader=dataloader, mean=mean, std=std, fp16=fp16)
 
+        return CudaLoader(loader=dataloader, 
+                          image_format=image_format, 
+                          image_mean=image_mean, 
+                          image_std=image_std, 
+                          scale_image_floats=True, 
+                          rank=rank)
 
+    def cpuloader(self,
+                  image_format: Optional[OutputFormat] = OutputFormat.NCHW_FLOAT32_TENSOR,
+                  label_format: Optional[OutputFormat] = OutputFormat.UNALTERED_INT64_TENSOR,
+                  image_mean: Optional[tuple] = None,
+                  image_std: Optional[tuple] = None,
+                  memory_format: Optional[torch.memory_format] = torch.contiguous_format,
+                  batch_size: Optional[int] = 1,
+                  shuffle: bool = False, 
+                  sampler: Optional[Sampler[int]] = None,
+                  batch_sampler: Optional[Sampler[Sequence[int]]] = None,
+                  num_workers: int = 0,
+                  pin_memory: bool = False, 
+                  drop_last: bool = False) -> CudaLoader:
 
-    def dataloader(self,
-                   channels_last_shape: Optional[bool] = False,
-                   channels_last_memory: Optional[bool] = False,
-                   batch_size: Optional[int] = 1,
-                   shuffle: bool = False, 
-                   sampler: Optional[Sampler[int]] = None,
-                   batch_sampler: Optional[Sampler[Sequence[int]]] = None,
-                   num_workers: int = 0,
-                   pin_memory: bool = False, 
-                   drop_last: bool = False) -> Union[DataLoader, CudaLoader]:
         """ 
             NOTE:
-                the output tensors contain just uint8 or int64 integers.
-
-            Get a torch.utils.data.DataLoader object associated with this dataset.
+                only images are converted in range [0, 1] and they should be floats.
 
             Args:
-                channels_last_shape (bool, optioanl): True to return images with the 
-                channel-last shape, False oterwise.
-                channels_last_memory (bool, optional): True to return tensors with the 
-                memory in channel last format, False to return tensors with contiguos
-                memory format.
+                image_format (OutputFormat, optional): the image output format.
+                label_format (OutputFormat, optional): the label output format.
+                image_mean (tuple, optional): the mean to subtract to images.
+                image_std (tuple, optional): the std to divide the images.
+                memory_format (torch.memory_format, optional): the torch memory format
+                for tensors.
                 batch_size (int, optional): the batch size.
                 shuffle (bool, optional): True to shuffle indices.
                 sampler (Sampler, optional): a sampler for indices.
@@ -628,15 +824,17 @@ class BasicImageFolder(Dataset):
                 pin_memory (bool, optional): True to pin gpu memory.
                 drop_last (bool, optional): True to drop last batch if incomplete.
 
-            Returns: 
-                a torch.utils.data.DataLoader object.
+             Returns: 
+                a CpuLoader
         """
-                
-        if channels_last_memory:
-            memory_format = torch.channels_last
-        else:
-            memory_format = torch.contiguous_format
-        collate_fn = get_collate(memory_format, not channels_last_shape, to_tensor=True)
+
+        assert "TENSOR" in image_format.name and "FLOAT" in image_format.name,\
+        "image_format should be a TENSOR format of FLOAT"
+
+        collate_fn = get_collate(image_format=image_format, 
+                                 label_format=label_format,
+                                 other_fields_format=OutputFormat.UNALTERED_INT64_TENSOR, 
+                                 memory_format=memory_format)
 
         dataloader = DataLoader(self, 
                                 batch_size=batch_size, 
@@ -648,14 +846,19 @@ class BasicImageFolder(Dataset):
                                 drop_last=drop_last,
                                 collate_fn=collate_fn)
 
-        return dataloader
+        return CpuLoader(loader=dataloader, 
+                          image_format=image_format, 
+                          image_mean=image_mean, 
+                          image_std=image_std, 
+                          scale_image_floats=True)
 
-    
+
     def write_database(self,
                        path: str,
                        numpy_images: Optional[bool] = False,
-                       num_workers: Optional[int] = 1,
-                       map_size: Optional[int] = int(1e12)):
+                       num_workers: Optional[int] = 4,
+                       map_size: Optional[int] = int(1e14),
+                       verbose: Optional[bool] = False):
         """ 
             NOTE: requires `lmdb` installed.
 
@@ -667,15 +870,23 @@ class BasicImageFolder(Dataset):
                 database.
                 num_workers (int, optional): the number of workers for the saving.
                 map_size (int, optional): the max number of kB allowed for the database.
+                verbose (bool, optional): True to print status.
 
         """
         import lmdb
-        self.images_database_as_numpy = numpy_images
 
         env = lmdb.open(path, map_size=map_size, lock=False)
         txn = env.begin(write=True)
-        collate_fn = get_collate(to_tensor=False, 
-                                 images_last2first=False)
+
+        if self.external_labels:
+            label_format = OutputFormat.UNALTERED_UNIT8_NUMPY
+        else:
+            label_format = OutputFormat.UNALTERED_INT64_NUMPY
+
+        collate_fn = get_collate(image_format=OutputFormat.UNALTERED_UNIT8_NUMPY,
+                                 label_format=label_format, 
+                                 other_fields_format=OutputFormat.UNALTERED_INT64_NUMPY,
+                                 memory_format=torch.contiguous_format)
 
         dataloader = DataLoader(self, 
                                 batch_size=1, 
@@ -683,10 +894,16 @@ class BasicImageFolder(Dataset):
                                 shuffle=False, 
                                 drop_last=False,
                                 collate_fn=collate_fn)
-            
+
+        print_step = len(dataloader)//10
+
         for idx, batch in enumerate(dataloader):
             image = batch.image[0]
-            if self.images_database_as_numpy:
+
+            if verbose and idx % print_step == 0:
+                print(f"Image {idx}/{len(dataloader)}")
+                
+            if numpy_images:
                 image = array_to_bytes(image)
             else:
                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -695,26 +912,48 @@ class BasicImageFolder(Dataset):
             label = array_to_bytes(batch.label[0])
             txn.put(('image'+ str(idx)).encode(), image)
             txn.put(('label'+ str(idx)).encode(), label)
-     
+
+
+        # in the save object the RAM images are not loaded because they are a Runtime
+        # loaded objects, so we set them to None, we save the object and then we set
+        # them back.
+
+        # Save tmp references
         tmp_loaded_images = self.loaded_images
         tmp_loaded_labels = self.loaded_labels 
+        tmp_ram_image_size = self.ram_image_size
+
+        # remove references from current object
         self.loaded_images = None
         self.loaded_labels = None
+        self.ram_image_size = None
 
+        # update state of dataset
+        self.database_state = DatasetState.DATABASE_NUMPY if numpy_images \
+                              else DatasetState.DATABASE_JPG
+        self.database_image_size = self._image_size
+        self.image_resizer = self.image_loader.resizer()
+        self.image_resizer.size = None
+        
+        # save the object
         encoded_object = pickle.dumps(self)
         txn.put('__object__'.encode(), encoded_object)
 
+        # take references back.
         self.loaded_images = tmp_loaded_images
         self.loaded_labels = tmp_loaded_labels
+        self.ram_image_size = tmp_ram_image_size
 
         txn.commit()
         env.close()
+
+        # initialize database for current object
+        self._initLMDB_env(path)
 
 
     def _initLMDB_env(self, path):
         """ Initializes the database from a path. """
         import lmdb
-        self.from_database = True
         self.lmdb_env = lmdb.open(path, readonly=True, lock=False)
         self.txn = None
 
@@ -907,4 +1146,4 @@ class AdvancedImageFolder(BasicImageFolder):
         if isinstance(values, list):
             values = torch.LongTensor(values)
 
-        self.pseudolabels[indices] = values
+        self.pseudolabels[indices] = values.cpu()

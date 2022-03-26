@@ -11,56 +11,61 @@ from typing import Callable, List, Optional, Any
 
 import torch
 from torch.utils.data import DataLoader
+import torch.distributed as dist
 
 import numpy as np
 import random
 
+from .enums import OutputFormat
 
 
-def get_collate(memory_format: Optional[Any] = torch.channels_last, 
-                images_last2first: Optional[bool] = True, 
-                to_tensor: Optional[bool] = False) -> Callable[[Any], SimpleNamespace]:
+def get_collate(image_format: OutputFormat,
+                label_format: OutputFormat,
+                other_fields_format: OutputFormat, 
+                memory_format: torch.memory_format) -> Callable[[Any], SimpleNamespace]:
     """
         Get the collate function.
 
         Args:
-            memory_format (torch.channel_last|torch.contiguous_format): the data memory
-            format for output torch.Tensors.
-            images_last2first (bool, optional): True to change the shape of images from
-            (H x W x C) to (C x H x W).
-            to_tensor (bool, optional): True to convert np.uint8 into Tensor
+            image_format (OutputFormat): the output format for images. 
+            label_format (OutputFormat): the output format for labels.
+            other_fields_format (OutputFormat): the output format for other fields.
+            memory_format (torch.memory_format): the data memory format for output 
+            torch.Tensors.
 
         Returns:
             Callable, the collate function.
     """
     return lambda batch: collate_function(batch, 
-                                          images_last2first, 
-                                          to_tensor, 
-                                          memory_format)
+                                          image_format=image_format,
+                                          label_format=label_format,
+                                          other_fields_format=other_fields_format,
+                                          memory_format=memory_format)
+
 
 def collate_function(batch: List[SimpleNamespace],
-                     images_last2first: bool,
-                     to_tensor: bool, 
-                     memory_format) -> SimpleNamespace:
-    """
-        The collate function.
+                     image_format: OutputFormat,
+                     label_format: OutputFormat,
+                     other_fields_format: OutputFormat,
+                     memory_format: torch.memory_format) -> SimpleNamespace:
+
+    """ 
+        NOTE: the collate function can covert types and shape of inputs following the
+        OutputFormats but it does not scales the values/range of tensors/arrays.
+        Since images inputs are uint8 the tensors/arrays will be in range [0, 255] even
+        if they are coverted to floats.
 
         Args:
             batch (list[SimpleNamespace]): the input batch.
-            images_last2first (bool, optional): True to change the shape of images from
-            (H x W x C) to (C x H x W).
-            to_tensor (bool, optional): True to convert np.uint8 into Tensor.
-            memory_format (torch.channel_last|torch.contiguous_format): the data memory
-            format for output torch.Tensors.
+            image_format (OutputFormat): the output format for images. 
+            label_format (OutputFormat): the output format for labels.
+            other_fields_format (OutputFormat): the output format for other fields.
+            memory_format (torch.memory_format): the data memory format for output 
+            torch.Tensors.
 
         Returns:
             a SimpleNamespace with collated fields.
         
-        NOTE:
-            current types supported inside batch's SimpleNamespaces:
-            - int, np.integer
-            - None
-            - np.ndarray
     """
 
     # get keys of SimpleNamespace
@@ -70,44 +75,49 @@ def collate_function(batch: List[SimpleNamespace],
 
     for k in keys:
         
+        # take the correct output format
+        if   k == "image":
+            channels_first, dtype, to_tensor = image_format.value
+        elif k == "label":
+            channels_first, dtype, to_tensor = label_format.value
+        else:
+            channels_first, dtype, to_tensor = other_fields_format.value
+
+
         first_value = batch[0].__dict__[k]
         
-        # CASE NONE
-        if first_value is None:
-            out_value = [None for _ in batch]
-
         # CASE INT
-        elif isinstance(first_value, int) or isinstance(first_value, np.integer):
+        if isinstance(first_value, int) or isinstance(first_value, np.integer):
             if to_tensor:
                 out_value = torch.tensor([sample.__dict__[k] for sample in batch], 
-                                          dtype=torch.int64)
+                                          dtype=dtype)
             else:
                 out_value = np.array([sample.__dict__[k] for sample in batch], 
-                                      dtype=np.uint8)
+                                      dtype=dtype)
         # CASE NDARRAY
         elif isinstance(first_value, np.ndarray):
             values = [sample.__dict__[k] for sample in batch]
 
             shape = values[0].shape
 
-            if len(shape) == 3 and images_last2first:
+            if len(shape) == 3 and channels_first:
                 new_shape = (batch_size, shape[2], shape[0], shape[1])
             else:
                 new_shape = tuple([batch_size] + list(shape))
 
             if to_tensor:
-                out_value = torch.zeros(new_shape, dtype=torch.uint8) \
-                             .contiguous(memory_format=memory_format)
+                out_value = torch.zeros(new_shape, dtype=dtype) \
+                                 .contiguous(memory_format=memory_format)
             else:
-                out_value = np.zeros(shape=new_shape, dtype=np.uint8)
+                out_value = np.zeros(shape=new_shape, dtype=dtype)
 
             for i, value in enumerate(values):
                 
-                if len(shape) == 3 and images_last2first:
+                if len(shape) == 3 and channels_first:
                     value = np.rollaxis(value, 2)
 
                 if to_tensor:
-                    value = torch.from_numpy(value)
+                    value = torch.from_numpy(value).to(dtype)
 
                 out_value[i] += value
 
@@ -121,6 +131,85 @@ def collate_function(batch: List[SimpleNamespace],
     return SimpleNamespace(**collate_dict)
 
 
+class CpuLoader:
+    def __init__(self,
+                 loader: DataLoader,
+                 image_format: OutputFormat,
+                 image_mean: Optional[tuple] = None,
+                 image_std:  Optional[tuple] = None,
+                 scale_image_floats: Optional[bool] = True):
+        """
+            Args:
+                loader (torch.utils.data.Dataloader): the dataloader.
+                mean (tuple, optional): the mean to subtract (only to images).
+                std (tuple, optional): the std to divide (only to images).
+                rank (int, optional): the local rank (device).
+        """
+        
+        if "NCHW" not in image_format.name and "NHWC" not in image_format.name:
+            raise ValueError("Images should be in NCHW or NHWC format.")
+
+        if "TENSOR" not in image_format.name:
+            raise ValueError("Images should be Tensors for the CpuLoader.")
+
+        self.dtype = image_format.value[1]
+
+        assert self.dtype == torch.float16 or self.dtype == torch.float32, \
+        "OutputFormat for images should be float16 or float32!" 
+
+        self.view  = [1, 3, 1, 1] if "NCHW" in image_format.name else [1, 1, 1, 3]
+
+        # do we need to scale images?
+        self.scale = scale_image_floats
+
+        self.image_mean = image_mean
+        self.image_std = image_std
+
+        # do we need to normalize images?
+        self.normalize = self.image_mean is not None and self.image_std is not None
+
+        if self.scale:
+            if self.normalize:
+                self.image_mean = [x * 255. for x in self.image_mean]
+                self.image_std  = [x * 255. for x in self.image_std]
+            else:
+                self.image_mean = [0., 0., 0.]
+                self.image_std  = [255., 255., 255.]
+
+
+        # dataloader
+        self.dataloader    = loader
+        self.sampler       = loader.sampler
+        self.batch_sampler = loader.batch_sampler
+        self.dataset       = loader.dataset
+
+      
+        if self.scale or self.normalize:
+            self.image_mean = torch.tensor(self.image_mean).to(self.dtype)\
+                              .view(self.view)
+            self.image_std  = torch.tensor(self.image_std).to(self.dtype)\
+                              .view(self.view)
+
+
+
+    def __iter__(self):
+
+        for batch in self.dataloader:
+
+            if self.normalize or self.scale:
+                batch.image = batch.image.to(self.dtype).sub_(self.image_mean)\
+                                         .div_(self.image_std)
+            else:
+                batch.image = batch.image.to(self.dtype)
+
+            yield batch
+
+
+    def __len__(self):
+        return len(self.loader)
+
+
+
 class CudaLoader:
     """
         A dataloader with prefatching that loads all data to gpu. 
@@ -128,37 +217,77 @@ class CudaLoader:
     """
     def __init__(self,
                  loader: DataLoader,
-                 mean: Optional[tuple] = None,
-                 std: Optional[tuple] = None,
-                 fp16=False):
+                 image_format: OutputFormat,
+                 image_mean: Optional[tuple] = None,
+                 image_std:  Optional[tuple] = None,
+                 scale_image_floats: Optional[bool] = True,
+                 rank: Optional[int] = None):
         """
             Args:
                 loader (torch.utils.data.Dataloader): the dataloader.
                 mean (tuple, optional): the mean to subtract (only to images).
                 std (tuple, optional): the std to divide (only to images).
-                fp16 (bool, optional): True to convert tensors to half precision.
+                rank (int, optional): the local rank (device).
         """
+        
+        if "NCHW" not in image_format.name and "NHWC" not in image_format.name:
+            raise ValueError("Images should be in NCHW or NHWC format.")
 
-        self.dataloader = loader
+        if "TENSOR" not in image_format.name:
+            raise ValueError("Images should be Tensors for the CudaLoader.")
 
-        self.mean = None
-        self.std  = None
-        self.normalize = False
+        self.dtype = image_format.value[1]
 
-        if mean is not None and std is not None:
-            self.mean = torch.tensor([x for x in mean]).cuda().view(1, 3, 1, 1)
-            self.std = torch.tensor([x for x in std]).cuda().view(1, 3, 1, 1)
-            self.normalize = True
+        assert self.dtype == torch.float16 or self.dtype == torch.float32, \
+        "OutputFormat for images should be float16 or float32!" 
 
-        self.fp16 = fp16
+        self.view  = [1, 3, 1, 1] if "NCHW" in image_format.name else [1, 1, 1, 3]
 
-        if fp16 and self.normalize:
-            self.mean = self.mean.half()
-            self.std = self.std.half()
+        # do we need to scale images?
+        self.scale = scale_image_floats
+
+        self.image_mean = image_mean
+        self.image_std = image_std
+
+        # do we need to normalize images?
+        self.normalize = self.image_mean is not None and self.image_std is not None
+
+        if self.scale:
+            if self.normalize:
+                self.image_mean = [x * 255. for x in self.image_mean]
+                self.image_std  = [x * 255. for x in self.image_std]
+            else:
+                self.image_mean = [0., 0., 0.]
+                self.image_std  = [255., 255., 255.]
+
+
+        # dataloader
+        self.dataloader    = loader
+        self.sampler       = loader.sampler
+        self.batch_sampler = loader.batch_sampler
+        self.dataset       = loader.dataset
+
+        # local rank 
+        self.rank = rank
+
+        # if None get local rank
+        if self.rank is None:
+            try:
+                self.rank = dist.get_rank()
+            except Exception:
+                self.rank = 0
+        
+        # send std and mean to local rank
+        if self.scale or self.normalize:
+            self.image_mean = torch.tensor(self.image_mean).to(self.dtype)\
+                              .to(self.rank).view(self.view)
+            self.image_std  = torch.tensor(self.image_std).to(self.dtype)\
+                              .to(self.rank).view(self.view)
+
 
     def __iter__(self):
 
-        stream = torch.cuda.Stream()
+        stream = torch.cuda.Stream(device=self.rank)
         first = True
 
         for batch in self.dataloader:
@@ -168,17 +297,14 @@ class CudaLoader:
                 
                 for k in batch.__dict__.keys():
                     next_input = batch.__dict__[k]
-                    next_input = next_input.cuda(non_blocking=True)
+                    next_input = next_input.to(self.rank, non_blocking=True)
 
                     if k == "image":
-                        if self.fp16 and self.normalize:
-                            next_input = next_input.half().sub_(self.mean).div_(self.std)
-                        elif self.fp16:
-                            next_input = next_input.half()
-                        elif self.normalize:
-                            next_input = next_input.float().sub_(self.mean).div_(self.std)
+                        if self.normalize or self.scale:
+                            next_input = next_input.to(self.dtype).sub_(self.image_mean)\
+                                         .div_(self.image_std)
                         else:
-                            next_input = next_input.float()
+                            next_input = next_input.to(self.dtype)
 
                     next_input_dict[k] = next_input
 
@@ -193,15 +319,7 @@ class CudaLoader:
         yield SimpleNamespace(**input_dict)
 
     def __len__(self):
-        return len(self.loader)
-
-    @property
-    def sampler(self):
-        return self.loader.sampler
-
-    @property
-    def dataset(self):
-        return self.loader.dataset
+        return len(self.dataloader)
 
 
     def _worker_init(worker_id, worker_seeding='all'):

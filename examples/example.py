@@ -3,15 +3,12 @@ src_path = os.path.join(os.path.dirname(__file__), "..", "src")
 sys.path.insert(0, src_path)
 
 
-from imagedataset import AdvanceImageFolder
-from torchvision.transforms import ToTensor, Resize, Compose
+from imagedataset import AdvancedImageFolder, LoaderPIL
 
-
-transform = Compose([Resize([224, 224]), ToTensor()])
-
-dataset = AdvanceImageFolder(root="example_dataset",
-                             name="my_great_dataset",
-                             transform=transform)
+image_loader = 
+dataset = AdvancedImageFolder(root="example_dataset",
+                              image_loader=LoaderPIL(size=223)
+                             name="my_great_dataset")
 
 # ..to load full dataset to RAM
 dataset.load_ram(verbose=True)
